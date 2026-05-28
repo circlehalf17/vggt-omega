@@ -14,6 +14,45 @@ from matplotlib import colormaps
 from scipy.spatial.transform import Rotation
 
 
+def predictions_to_ply(
+    predictions: dict,
+    conf_thres: float = 20.0,
+    max_points: int = 1000000,
+    filter_depth_edges: bool = True,
+    depth_edge_rtol: float = 0.03,
+) -> trimesh.PointCloud:
+    """Extract a colored PointCloud from predictions and return as trimesh.PointCloud for PLY export."""
+    conf_thres = max(2.0, float(conf_thres))
+
+    points = predictions["world_points_from_depth"]
+    conf = predictions["depth_conf"]
+    if filter_depth_edges and "depth" in predictions:
+        conf = conf.copy()
+        conf[depth_edge(predictions["depth"][..., 0], rtol=depth_edge_rtol)] = 0.0
+    images = predictions["images"]
+
+    vertices = points.reshape(-1, 3)
+    colors = _images_to_rgb(images).reshape(-1, 3)
+    colors = (colors * 255).clip(0, 255).astype(np.uint8)
+    conf = conf.reshape(-1)
+
+    mask = np.isfinite(vertices).all(axis=1) & np.isfinite(conf)
+    if conf_thres > 0 and np.any(mask):
+        conf_threshold = np.percentile(conf[mask], conf_thres)
+        mask &= conf >= conf_threshold
+    mask &= conf > 1e-5
+
+    vertices = vertices[mask]
+    colors = colors[mask]
+    vertices, colors = _limit_points(vertices, colors, max_points)
+
+    if vertices.size == 0:
+        vertices = np.array([[0.0, 0.0, 0.0]], dtype=np.float32)
+        colors = np.array([[255, 255, 255]], dtype=np.uint8)
+
+    return trimesh.PointCloud(vertices=vertices, colors=colors)
+
+
 def predictions_to_glb(
     predictions: dict,
     conf_thres: float = 20.0,
