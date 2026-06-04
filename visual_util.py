@@ -20,8 +20,15 @@ def predictions_to_ply(
     max_points: int = 1000000,
     filter_depth_edges: bool = True,
     depth_edge_rtol: float = 0.03,
+    cam_sphere_pts: int = 300,
+    cam_sphere_radius: float = 0.0,
 ) -> trimesh.PointCloud:
-    """Extract a colored PointCloud from predictions and return as trimesh.PointCloud for PLY export."""
+    """Extract a colored PointCloud from predictions and return as trimesh.PointCloud for PLY export.
+
+    If cam_sphere_radius > 0 and predictions contains 'extrinsic' (W2C, N×3×4),
+    each camera centre is visualised as a sphere cluster colored green→red over time.
+    cam_sphere_radius=0 auto-scales to ~3% of the scene spread.
+    """
     conf_thres = max(2.0, float(conf_thres))
 
     points = predictions["world_points_from_depth"]
@@ -49,6 +56,41 @@ def predictions_to_ply(
     if vertices.size == 0:
         vertices = np.array([[0.0, 0.0, 0.0]], dtype=np.float32)
         colors = np.array([[255, 255, 255]], dtype=np.uint8)
+
+    # ── Camera trajectory spheres ─────────────────────────────────────────
+    if "extrinsic" in predictions and cam_sphere_pts > 0:
+        extrinsic = predictions["extrinsic"]          # (N, 3, 4)  W2C
+        N_cam = len(extrinsic)
+        R = extrinsic[:, :3, :3]                      # (N, 3, 3)
+        t = extrinsic[:, :3, 3]                       # (N, 3)
+        cam_centers = -np.einsum("nij,nj->ni", R.transpose(0, 2, 1), t)  # (N, 3)
+
+        # Auto-scale radius to ~3% of scene spread
+        if cam_sphere_radius <= 0.0:
+            spread = np.abs(cam_centers).max() + 1e-6
+            if vertices.size > 0:
+                spread = max(spread, np.abs(vertices).max())
+            cam_sphere_radius = spread * 0.01
+
+        rng = np.random.default_rng(0)
+        sphere_verts_list = []
+        sphere_cols_list  = []
+        for i, center in enumerate(cam_centers):
+            frac = i / max(N_cam - 1, 1)             # 0 → 1 (green → red)
+            col  = np.array([int(255 * frac), int(255 * (1 - frac)), 0], dtype=np.uint8)
+
+            # Random points uniformly on sphere surface
+            dirs = rng.standard_normal((cam_sphere_pts, 3)).astype(np.float32)
+            dirs /= np.linalg.norm(dirs, axis=1, keepdims=True) + 1e-12
+            pts  = center + dirs * cam_sphere_radius
+
+            sphere_verts_list.append(pts)
+            sphere_cols_list.append(np.tile(col, (cam_sphere_pts, 1)))
+
+        sphere_verts = np.concatenate(sphere_verts_list, axis=0)
+        sphere_cols  = np.concatenate(sphere_cols_list,  axis=0)
+        vertices = np.concatenate([vertices, sphere_verts], axis=0)
+        colors   = np.concatenate([colors,   sphere_cols],  axis=0)
 
     return trimesh.PointCloud(vertices=vertices, colors=colors)
 
