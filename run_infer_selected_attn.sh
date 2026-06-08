@@ -1,6 +1,6 @@
 #!/bin/bash
-#SBATCH --job-name=vggt_mydata_30fps
-#SBATCH --partition=l40sq
+#SBATCH --job-name=vggt_attn_sel
+#SBATCH --partition=h200q
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=8
@@ -9,16 +9,15 @@
 #SBATCH --time=06:00:00
 #SBATCH --output=/dev/null
 #SBATCH --error=/dev/null
-#SBATCH --nodelist=iREMB-C-08
+#SBATCH --nodelist=iREMB-C-02
 
 set -euo pipefail
 
 PROJECT_NAME="vggt-omega"
+EXPERIMENT_NAME="ego4d_selected_attn"
 SIF_IMAGE="/scratch/mip25/wbLee/pytorch.sif"
-EXPERIMENT_NAME="mydata_30fps"
 
 JOBDIR="/scratch/mip25/wbLee/outputs/logs/${PROJECT_NAME}/${EXPERIMENT_NAME}/job_${SLURM_JOB_ID}"
-JOBDIR_WS="/workspace/outputs/logs/${PROJECT_NAME}/${EXPERIMENT_NAME}/job_${SLURM_JOB_ID}"
 mkdir -p "$JOBDIR"
 
 exec 1>"$JOBDIR/out.log"
@@ -48,16 +47,9 @@ srun --mpi=pmix singularity exec --nv \
 
         nvidia-smi
 
-        python infer_my.py \
-            --checkpoint  /workspace/outputs/checkpoints/vggt-omega/vggt_omega_1b_512.pt \
-            --data-root   /workspace/data/mydata \
-            --output-dir  /workspace/outputs/renders/vggt-omega/mydata_30fps \
-            --fps         30.0 \
-            --image-resolution 512 \
-            --conf-thres 20.0 \
-            --max-points-k 1000 \
-            2>&1 | tee \"$JOBDIR_WS/infer.log\"
-    " 2>&1 | tee "$JOBDIR/train.log"
+        python infer_selected_attn.py \
+            2>&1 | tee /workspace/outputs/logs/${PROJECT_NAME}/${EXPERIMENT_NAME}/job_${SLURM_JOB_ID}/attn.log
+    "
 
 echo "Exit code: $?"
 echo "End: $(date)"

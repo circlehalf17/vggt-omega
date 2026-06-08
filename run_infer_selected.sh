@@ -1,24 +1,23 @@
 #!/bin/bash
-#SBATCH --job-name=vggt_attn
-#SBATCH --partition=l40sq
+#SBATCH --job-name=vggt_selected
+#SBATCH --partition=h200q
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=8
 #SBATCH --gres=gpu:1
 #SBATCH --mem=64G
-#SBATCH --time=24:00:00
+#SBATCH --time=06:00:00
 #SBATCH --output=/dev/null
 #SBATCH --error=/dev/null
-#SBATCH --nodelist=iREMB-C-08
+#SBATCH --nodelist=iREMB-C-02
 
 set -euo pipefail
 
 PROJECT_NAME="vggt-omega"
+EXPERIMENT_NAME="ego4d_selected"
 SIF_IMAGE="/scratch/mip25/wbLee/pytorch.sif"
-EXPERIMENT_NAME="ego4d_attn"
 
 JOBDIR="/scratch/mip25/wbLee/outputs/logs/${PROJECT_NAME}/${EXPERIMENT_NAME}/job_${SLURM_JOB_ID}"
-JOBDIR_WS="/workspace/outputs/logs/${PROJECT_NAME}/${EXPERIMENT_NAME}/job_${SLURM_JOB_ID}"
 mkdir -p "$JOBDIR"
 
 exec 1>"$JOBDIR/out.log"
@@ -48,18 +47,9 @@ srun --mpi=pmix singularity exec --nv \
 
         nvidia-smi
 
-        python attn_viz.py \
-            --checkpoint  /workspace/outputs/checkpoints/vggt-omega/vggt_omega_1b_512.pt \
-            --ego4d-root  /workspace/data/Ego4D/v2 \
-            --ego4d-json  /workspace/data/Ego4D/ego4d.json \
-            --eval-list   /workspace/data/Ego4D/eval_50seqs.txt \
-            --output-dir  /workspace/outputs/renders/vggt-omega/ego4d \
-            --image-resolution 512 \
-            --sample-fps 6.0 \
-            --max-duration 10.0 \
-            --tmp-dir /tmp/vggt_ego4d_attn_frames \
-            2>&1 | tee \"$JOBDIR_WS/attn_viz.log\"
-    " 2>&1 | tee "$JOBDIR/train.log"
+        python infer_selected.py \
+            2>&1 | tee /workspace/outputs/logs/${PROJECT_NAME}/${EXPERIMENT_NAME}/job_${SLURM_JOB_ID}/infer.log
+    "
 
 echo "Exit code: $?"
 echo "End: $(date)"
