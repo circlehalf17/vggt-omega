@@ -306,3 +306,161 @@ def custom_interpolate(
         for chunk in chunks
     ]
     return torch.cat(interpolated_chunks, dim=0).contiguous()
+
+
+class MLPDenseHead(nn.Module):
+    """
+    Ablation variant of DenseHead that replaces the DPT-style CNN fusion path
+    with a purely token-level MLP operating directly on aggregator patch tokens.
+
+    Memory/quality tradeoff:
+      - No spatial convolutions, resize layers, or multi-scale refinenets.
+        Lower peak memory, simpler gradient flow, and fewer parameters than DenseHead.
+      - Each patch is predicted independently with no cross-patch spatial
+        interaction, which can produce visible block artefacts at patch boundaries,
+        especially in low-texture or homogeneous regions.
+      - Intended for ablation studies; not a quality replacement for DenseHead.
+    """
+
+    def __init__(
+        self,
+        dim_in: int = 2048,
+        patch_size: int = 16,
+        mlp_dim: int = 1024,
+        intermediate_layer_idx: list[int] = [4, 11, 17, 23],
+    ) -> None:
+        super().__init__()
+        self.patch_size = patch_size
+        self.intermediate_layer_idx = intermediate_layer_idx
+
+        self.norm = nn.LayerNorm(dim_in, eps=1e-5)
+
+        num_layers = len(intermediate_layer_idx)
+
+        # Per-layer projection: each layer independently projected to mlp_dim
+        # (equivalent role to DPT's 1×1 Conv2d + layer*_rn, but in token space)
+        self.layer_projs = nn.ModuleList([
+            nn.Linear(dim_in, mlp_dim) for _ in intermediate_layer_idx
+        ])
+
+        # Fusion projection: concat all layer projections → mlp_dim
+        # Allows the model to learn how much each layer (shallow/deep) contributes,
+        # rather than assuming equal contribution via naive sum.
+        self.fusion_proj = nn.Linear(num_layers * mlp_dim, mlp_dim)
+
+        # 2-layer per-patch MLP applied after fusion
+        self.mlp = nn.Sequential(
+            nn.Linear(mlp_dim, mlp_dim),
+            nn.GELU(),
+            nn.Linear(mlp_dim, mlp_dim),
+            nn.GELU(),
+        )
+
+        # Each patch predicts all patch_size² pixels in one shot
+        pixels_per_patch = patch_size * patch_size
+        self.depth_head = nn.Linear(mlp_dim, pixels_per_patch)
+        self.conf_head = nn.Linear(mlp_dim, pixels_per_patch)
+        _init_mlp_small_conf_head(self.conf_head)
+
+    def forward(
+        self,
+        aggregated_tokens_list: list[torch.Tensor | None],
+        images: torch.Tensor,
+        patch_token_start: int,
+        frames_chunk_size: int | None = 8,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if patch_token_start is None:
+            raise ValueError("patch_token_start is required for MLPDenseHead")
+
+        _, num_frames, _, _, _ = images.shape
+
+        if frames_chunk_size is None or frames_chunk_size >= num_frames:
+            return self._forward_impl(aggregated_tokens_list, images, patch_token_start)
+
+        assert frames_chunk_size > 0
+
+        depth_chunks = []
+        depth_conf_chunks = []
+        for frames_start_idx in range(0, num_frames, frames_chunk_size):
+            frames_end_idx = min(frames_start_idx + frames_chunk_size, num_frames)
+            depth_chunk, depth_conf_chunk = self._forward_impl(
+                aggregated_tokens_list,
+                images,
+                patch_token_start,
+                frames_start_idx,
+                frames_end_idx,
+            )
+            depth_chunks.append(depth_chunk)
+            depth_conf_chunks.append(depth_conf_chunk)
+
+        return torch.cat(depth_chunks, dim=1), torch.cat(depth_conf_chunks, dim=1)
+
+    def _forward_impl(
+        self,
+        aggregated_tokens_list: list[torch.Tensor | None],
+        images: torch.Tensor,
+        patch_token_start: int,
+        frames_start_idx: int | None = None,
+        frames_end_idx: int | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if frames_start_idx is not None and frames_end_idx is not None:
+            images = images[:, frames_start_idx:frames_end_idx].contiguous()
+
+        batch_size, num_frames, _, height, width = images.shape
+        patch_h, patch_w = height // self.patch_size, width // self.patch_size
+
+        # Collect per-layer projections for concat fusion
+        layer_feats = []
+        for feature_idx, layer_idx in enumerate(self.intermediate_layer_idx):
+            x = aggregated_tokens_list[layer_idx]
+            if x is None:
+                raise ValueError(f"Aggregator did not cache layer {layer_idx}, which MLPDenseHead needs.")
+            x = x[:, :, patch_token_start:]
+            if frames_start_idx is not None and frames_end_idx is not None:
+                x = x[:, frames_start_idx:frames_end_idx]
+            if x.dtype != torch.float32:
+                x = x.float()
+            # [B, S, N_patch, C] → [B*S, N_patch, C]
+            x = x.reshape(batch_size * num_frames, -1, x.shape[-1])
+            x = self.norm(x)
+            layer_feats.append(self.layer_projs[feature_idx](x))   # [B*S, N_patch, mlp_dim]
+
+        # Concat → fusion projection: [B*S, N_patch, num_layers*mlp_dim] → [B*S, N_patch, mlp_dim]
+        # Each layer's contribution (shallow spatial vs. deep semantic) is learned, not assumed equal.
+        fused = self.fusion_proj(torch.cat(layer_feats, dim=-1))
+
+        fused = self.mlp(fused)   # [B*S, N_patch, mlp_dim]
+
+        depth_logits = self.depth_head(fused)   # [B*S, N_patch, ps²]
+        conf_logits  = self.conf_head(fused)    # [B*S, N_patch, ps²]
+
+        ps = self.patch_size
+        bs_total = batch_size * num_frames
+
+        # Fold patch grid back to spatial image: (ph, pw, ps, ps) → (ph*ps, pw*ps)
+        depth_logits = (
+            depth_logits.view(bs_total, patch_h, patch_w, ps, ps)
+            .permute(0, 1, 3, 2, 4)
+            .reshape(bs_total, patch_h * ps, patch_w * ps)
+        )
+        conf_logits = (
+            conf_logits.view(bs_total, patch_h, patch_w, ps, ps)
+            .permute(0, 1, 3, 2, 4)
+            .reshape(bs_total, patch_h * ps, patch_w * ps)
+        )
+
+        depth = torch.exp(depth_logits).unsqueeze(-1)   # [B*S, H, W, 1]
+        depth_conf = 1.0 + torch.exp(conf_logits)       # [B*S, H, W]
+
+        depth = depth.view(batch_size, num_frames, *depth.shape[1:]).float()
+        depth_conf = depth_conf.view(batch_size, num_frames, *depth_conf.shape[1:]).float()
+
+        return depth, depth_conf
+
+
+def _init_mlp_small_conf_head(linear: nn.Linear) -> None:
+    """Initialize confidence head bias so initial confidence ≈ 1.05 (matching DenseHead)."""
+    nn.init.zeros_(linear.weight)
+    if linear.bias is None:
+        raise ValueError("conf_head Linear must have bias")
+    nn.init.constant_(linear.bias, math.log(1.05 - 1.0))

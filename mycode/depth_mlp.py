@@ -1,8 +1,14 @@
 #!/usr/bin/env python3
 """
-Depth map visualization for hand-selected stress/control clips.
+Depth map visualization using the MLP dense head (ablation variant).
 
-Outputs per clip (under OUTPUT_BASE/<type>/<name>/):
+Identical pipeline to infer_selected_depth.py except:
+  - VGGTOmega is instantiated with dense_head_type="mlp"
+  - checkpoint is loaded with strict=False (pretrained aggregator weights are
+    reused; the MLP dense head is randomly initialized, which is the ablation)
+  - outputs are written under depth/MLP/ instead of depth/CNN/
+
+Outputs per clip (under OUTPUT_BASE/<clip_type>/<name>/):
   depth_frame_xxx.png   – per-frame depth map (plasma colormap, clip-normalized)
   depth_video.mp4       – depth map video
   original.mp4          – original 10s clip
@@ -24,7 +30,6 @@ import torch
 
 from vggt_omega.models import VGGTOmega
 from vggt_omega.utils.load_fn import load_and_preprocess_images
-from vggt_omega.utils.pose_enc import encoding_to_camera
 
 
 # ── Clip list ─────────────────────────────────────────────────────────────────
@@ -44,8 +49,9 @@ CLIPS = [
 ]
 
 VIDEO_ROOT  = '/workspace/data/Ego4D/v2/full_scale'
-OUTPUT_BASE = '/workspace/outputs/renders/vggt-omega/ego4d/depth'
-CHECKPOINT  = '/workspace/outputs/checkpoints/vggt-omega/vggt_omega_1b_512.pt'
+OUTPUT_BASE = '/workspace/outputs/renders/vggt-omega/ego4d/depth/MLP'
+CHECKPOINT       = '/workspace/outputs/checkpoints/vggt-omega/vggt_omega_1b_512.pt'
+MLP_HEAD_CKPT    = '/workspace/outputs/checkpoints/vggt-omega/mlp_distill/mlp_head_step0050000.pt'
 IMAGE_RES   = 512
 SAMPLE_FPS  = 6.0
 
@@ -54,10 +60,21 @@ _CMAP = plt.get_cmap('plasma')
 
 # ── Model ─────────────────────────────────────────────────────────────────────
 
-def load_model(checkpoint_path: str) -> VGGTOmega:
-    model = VGGTOmega().eval()
+def load_model(checkpoint_path: str, mlp_head_ckpt: str = MLP_HEAD_CKPT) -> VGGTOmega:
+    # 1) Load pretrained backbone (aggregator + camera head); MLP head stays random
+    model = VGGTOmega(dense_head_type="mlp").eval()
     state_dict = torch.load(checkpoint_path, map_location='cpu')
-    model.load_state_dict(state_dict)
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    other_missing = [k for k in missing if not k.startswith('dense_head')]
+    if other_missing:
+        print(f'  WARN: non-dense_head keys missing: {other_missing[:5]}')
+    print(f'  Backbone loaded (aggregator + camera_head).')
+
+    # 2) Load trained MLP head weights on top
+    mlp_ckpt = torch.load(mlp_head_ckpt, map_location='cpu')
+    model.dense_head.load_state_dict(mlp_ckpt['model_state_dict'])
+    print(f'  MLP head loaded from: {mlp_head_ckpt}  (step={mlp_ckpt.get("step", "?")})')
+
     return model.to('cuda')
 
 
@@ -99,17 +116,16 @@ def depth_to_rgb(depth_map: np.ndarray, d_min: float, d_max: float) -> np.ndarra
     """Normalize depth to [0,1] with clip-level range, apply plasma colormap → BGR uint8."""
     norm = (depth_map - d_min) / (d_max - d_min + 1e-8)
     norm = np.clip(norm, 0.0, 1.0)
-    rgba = (_CMAP(norm) * 255).astype(np.uint8)      # H×W×4, RGBA
+    rgba = (_CMAP(norm) * 255).astype(np.uint8)
     return cv2.cvtColor(rgba[:, :, :3], cv2.COLOR_RGB2BGR)
 
 
 def save_depth_frames(depth: np.ndarray, out_dir: str) -> list:
     """
-    depth: (S, H, W, 1) — camera-space depth in world units
+    depth: (S, H, W, 1) — depth predictions from MLPDenseHead
     Returns list of BGR frames for video writing.
     """
     d = depth[..., 0]                                 # (S, H, W)
-    # Clip-level normalization with 2/98 percentile for robustness
     d_min = float(np.percentile(d, 2))
     d_max = float(np.percentile(d, 98))
     print(f'  Depth range: [{d_min:.3f}, {d_max:.3f}] (2-98 pct)')
@@ -181,7 +197,7 @@ def clip_out_name(uid: str, start: int, end: int, role: str) -> str:
 
 
 def main():
-    print(f'Loading model from {CHECKPOINT}')
+    print(f'Loading model (MLPDenseHead) from {CHECKPOINT}')
     model = load_model(CHECKPOINT)
     print('Model loaded.\n')
 
@@ -216,7 +232,7 @@ def main():
 
             image_paths = sorted(glob.glob(os.path.join(tmp_dir, 'frame_*.jpg')))
 
-            print('  Running inference ...')
+            print('  Running inference (MLP head) ...')
             try:
                 pred = run_inference(image_paths, model)
             except Exception as e:
