@@ -14,7 +14,7 @@
 set -euo pipefail
 
 PROJECT_NAME="vggt-omega"
-EXPERIMENT_NAME="ego4d_selected"
+EXPERIMENT_NAME="ego4d_reconstruction_rotation"
 SIF_IMAGE="/scratch/mip25/wbLee/pytorch.sif"
 
 JOBDIR="/scratch/mip25/wbLee/outputs/logs/${PROJECT_NAME}/${EXPERIMENT_NAME}/job_${SLURM_JOB_ID}"
@@ -47,7 +47,7 @@ srun --mpi=pmix singularity exec --nv \
 
         nvidia-smi
 
-        python infer_selected.py \
+        python mycode/reconstruction.py \
             2>&1 | tee /workspace/outputs/logs/${PROJECT_NAME}/${EXPERIMENT_NAME}/job_${SLURM_JOB_ID}/infer.log
     "
 

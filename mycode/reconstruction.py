@@ -1,10 +1,15 @@
 """
-VGGT-Omega inference on hand-selected stress/control clips.
+VGGT-Omega inference on Ego4D rotation labeling clips.
 
-Outputs per clip (under OUTPUT_BASE/<type>/<uid_start-ends[_role]>/):
+Inputs:
+  /workspace/data/ego4d/v2/label/rotation_low/*.mp4
+  /workspace/data/ego4d/v2/label/rotation_medium/*.mp4
+  /workspace/data/ego4d/v2/label/rotation_high/*.mp4
+
+Outputs per clip (under OUTPUT_BASE/rotation_<level>/<clip_name>/):
   camera_trajectory.png   – estimated camera path
   scene.ply               – point cloud with camera spheres (1/5 default radius)
-  original.mp4            – original 10s clip extracted from source video
+  original.mp4            – original 10s input clip
 """
 import glob
 import os
@@ -24,32 +29,16 @@ from vggt_omega.utils.load_fn import load_and_preprocess_images
 from vggt_omega.utils.pose_enc import encoding_to_camera
 
 
-# ── Clip list ─────────────────────────────────────────────────────────────────
-# (clip_type, video_uid, start_sec, end_sec, role)
+# ── Rotation clip roots ───────────────────────────────────────────────────────
 
-CLIPS = [
-    # control
-    ('control', '0b9ee926-00f1-4b22-9e83-b664c5e465e4', 1492, 1503, ''),
-    ('control', '1cdc92fa-50cd-4461-adf2-ece8cb2a5d31',  940,  951, ''),
-    ('control', '39011e23-5fe4-41cd-b146-f3f9e3f3941a', 3776, 3787, ''),
-    # dynamic
-    ('dynamic', '1eb500cd-cdb4-415e-8bf6-cc1289edf0ee',    0,   11, ''),
-    ('dynamic', '3c826d8a-22b9-4083-a315-2aeee7bde095',   51,   61, ''),
-    ('dynamic', '04fe8f4d-081e-437e-a56a-2d53b6233fc9',   13,   26, ''),
-    # egomotion (stress/control pairs within same video)
-    ('egomotion', '1b1acfa6-ee3b-483c-9c0a-245d70d7125f',   52,   65, 'control'),
-    ('egomotion', '1b1acfa6-ee3b-483c-9c0a-245d70d7125f',  902,  916, 'stress'),
-    ('egomotion', '04fe8f4d-081e-437e-a56a-2d53b6233fc9', 3240, 3254, 'control'),
-    ('egomotion', '04fe8f4d-081e-437e-a56a-2d53b6233fc9',  476,  489, 'stress'),
-    ('egomotion', 'cfa96e76-d909-4ba5-bccb-77402fde6be7',  316,  327, 'control'),
-    ('egomotion', 'cfa96e76-d909-4ba5-bccb-77402fde6be7', 1001, 1011, 'stress'),
-]
-
-VIDEO_ROOT  = '/workspace/data/Ego4D/v2/full_scale'
-OUTPUT_BASE = '/workspace/outputs/renders/vggt-omega/ego4d'
-CHECKPOINT  = '/workspace/outputs/checkpoints/vggt-omega/vggt_omega_1b_512.pt'
+INPUT_BASE = '/workspace/data/ego4d/v2/label'
+OUTPUT_BASE = '/workspace/outputs/renders/vggt-omega/ego4d/reconstruction'
+ROTATION_LEVELS = ('low', 'medium', 'high')
+CHECKPOINT  = '/workspace/outputs/checkpoints/vggt-omega/pretrain/vggt_omega_1b_512.pt'
 IMAGE_RES   = 512
 SAMPLE_FPS  = 6.0
+CLIP_START_SEC = 0.0
+CLIP_END_SEC = 10.0
 CONF_THRES  = 20.0
 MAX_POINTS  = 1_000_000
 
@@ -221,9 +210,16 @@ def save_original_clip(video_path: str, start_sec: float, end_sec: float,
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
-def clip_out_name(uid: str, start: int, end: int, role: str) -> str:
-    role_tag = f'_{role}' if role else ''
-    return f'{uid}_{start}-{end}s{role_tag}'
+def list_rotation_clips():
+    clips = []
+    for level in ROTATION_LEVELS:
+        clip_type = f'rotation_{level}'
+        input_dir = os.path.join(INPUT_BASE, clip_type)
+        video_paths = sorted(glob.glob(os.path.join(input_dir, '*.mp4')))
+        for video_path in video_paths:
+            clip_name = os.path.splitext(os.path.basename(video_path))[0]
+            clips.append((clip_type, clip_name, video_path))
+    return clips
 
 
 def main():
@@ -231,26 +227,28 @@ def main():
     model = load_model(CHECKPOINT)
     print('Model loaded.\n')
 
-    for i, (clip_type, uid, start, end, role) in enumerate(CLIPS):
-        name = clip_out_name(uid, start, end, role)
-        out_dir = os.path.join(OUTPUT_BASE, clip_type, name)
-        print(f'[{i+1}/{len(CLIPS)}] {clip_type}/{name}')
+    clips = list_rotation_clips()
+    print(f'Found {len(clips)} rotation clips under {INPUT_BASE}\n')
+
+    for i, (clip_type, clip_name, video_path) in enumerate(clips):
+        out_dir = os.path.join(OUTPUT_BASE, clip_type, clip_name)
+        print(f'[{i+1}/{len(clips)}] {clip_type}/{clip_name}')
 
         # Skip if already done
         if os.path.exists(os.path.join(out_dir, 'scene.ply')):
             print('  Already done, skipping.')
             continue
 
-        video_path = os.path.join(VIDEO_ROOT, uid + '.mp4')
         if not os.path.exists(video_path):
-            print(f'  SKIP: video not found')
+            print(f'  SKIP: clip not found: {video_path}')
             continue
 
         os.makedirs(out_dir, exist_ok=True)
 
         with tempfile.TemporaryDirectory() as tmp_dir:
             print(f'  Extracting frames at {SAMPLE_FPS}fps ...')
-            n = extract_frames(video_path, tmp_dir, start, end, SAMPLE_FPS)
+            n = extract_frames(
+                video_path, tmp_dir, CLIP_START_SEC, CLIP_END_SEC, SAMPLE_FPS)
             print(f'  {n} frames extracted')
 
             if n < 2:
@@ -264,7 +262,7 @@ def main():
         save_trajectory_png(predictions['extrinsic'],
                             os.path.join(out_dir, 'camera_trajectory.png'))
         save_ply(predictions, os.path.join(out_dir, 'scene.ply'))
-        save_original_clip(video_path, start, end,
+        save_original_clip(video_path, CLIP_START_SEC, CLIP_END_SEC,
                            os.path.join(out_dir, 'original.mp4'))
         print()
 

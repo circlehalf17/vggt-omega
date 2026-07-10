@@ -47,7 +47,7 @@ srun --mpi=pmix singularity exec --nv \
 
         nvidia-smi
 
-        python distill_mlp_head.py \
+        python mycode/distill_mlp_head.py \
             --total_steps 50000 \
             --grad_accum  8 \
             --lr          1e-4 \

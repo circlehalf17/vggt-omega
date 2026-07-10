@@ -45,7 +45,7 @@ from vggt_omega.utils.load_fn import load_and_preprocess_images
 
 VIDEO_ROOT   = '/workspace/data/Ego4D/v2/full_scale'
 EGO4D_JSON   = '/workspace/data/Ego4D/ego4d.json'
-CHECKPOINT   = '/workspace/outputs/checkpoints/vggt-omega/vggt_omega_1b_512.pt'
+CHECKPOINT   = '/workspace/outputs/checkpoints/vggt-omega/pretrain/vggt_omega_1b_512.pt'
 OUTPUT_DIR   = '/workspace/outputs/checkpoints/vggt-omega/mlp_distill'
 
 IMAGE_RES    = 512
@@ -196,6 +196,9 @@ def cosine_lr(step: int, warmup: int, total: int,
 def save_ckpt(out_dir: str, step: int, student: nn.Module,
               optimizer: torch.optim.Optimizer, loss: float) -> None:
     os.makedirs(out_dir, exist_ok=True)
+    kept = sorted(f for f in os.listdir(out_dir) if f.startswith('mlp_head_step'))
+    for old in kept[:-2]:
+        os.remove(os.path.join(out_dir, old))
     path = os.path.join(out_dir, f'mlp_head_step{step:07d}.pt')
     torch.save({
         'step': step,
@@ -203,9 +206,6 @@ def save_ckpt(out_dir: str, step: int, student: nn.Module,
         'optimizer_state':  optimizer.state_dict(),
         'loss': loss,
     }, path)
-    kept = sorted(f for f in os.listdir(out_dir) if f.startswith('mlp_head_step'))
-    for old in kept[:-3]:
-        os.remove(os.path.join(out_dir, old))
     print(f'  [ckpt] → {path}')
 
 
