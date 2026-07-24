@@ -2,13 +2,14 @@
 VGGT-Omega inference on Ego4D rotation labeling clips.
 
 Inputs:
-  /workspace/data/ego4d/v2/label/rotation_low/*.mp4
-  /workspace/data/ego4d/v2/label/rotation_medium/*.mp4
-  /workspace/data/ego4d/v2/label/rotation_high/*.mp4
+  data/ego4d/v2/label/rotation_low/*.mp4
+  data/ego4d/v2/label/rotation_medium/*.mp4
+  data/ego4d/v2/label/rotation_high/*.mp4
 
-Outputs per clip (under OUTPUT_BASE/rotation_<level>/<clip_name>/):
+Outputs per clip (under outputs/renders/vggt-omega/ego4d/reconstruction/rotation_<level>/<clip_name>/):
   camera_trajectory.png   – estimated camera path
-  scene.ply               – point cloud with camera spheres (1/5 default radius)
+  scene.ply               – reconstructed point cloud
+  predictions_pose.npz    – predicted VGGT-Omega camera pose/intrinsics
   original.mp4            – original 10s input clip
 """
 import glob
@@ -31,10 +32,12 @@ from vggt_omega.utils.pose_enc import encoding_to_camera
 
 # ── Rotation clip roots ───────────────────────────────────────────────────────
 
-INPUT_BASE = '/workspace/data/ego4d/v2/label'
-OUTPUT_BASE = '/workspace/outputs/renders/vggt-omega/ego4d/reconstruction'
-ROTATION_LEVELS = ('low', 'medium', 'high')
-CHECKPOINT  = '/workspace/outputs/checkpoints/vggt-omega/pretrain/vggt_omega_1b_512.pt'
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../..'))
+INPUT_BASE = os.path.join(PROJECT_ROOT, 'data/ego4d/v2/label')
+OUTPUT_BASE = os.path.join(PROJECT_ROOT, 'outputs/renders/vggt-omega/ego4d/reconstruction')
+ROTATION_LEVELS = ('rotation_low', 'rotation_medium', 'rotation_high')
+CHECKPOINT  = os.path.join(PROJECT_ROOT, 'outputs/checkpoints/vggt-omega/vggt_omega_1b_512.pt')
+WORKSPACE_CHECKPOINT = '/workspace/outputs/checkpoints/vggt-omega/vggt_omega_1b_512.pt'
 IMAGE_RES   = 512
 SAMPLE_FPS  = 6.0
 CLIP_START_SEC = 0.0
@@ -46,6 +49,8 @@ MAX_POINTS  = 1_000_000
 # ── Model ─────────────────────────────────────────────────────────────────────
 
 def load_model(checkpoint_path: str) -> VGGTOmega:
+    if not os.path.exists(checkpoint_path) and os.path.exists(WORKSPACE_CHECKPOINT):
+        checkpoint_path = WORKSPACE_CHECKPOINT
     model = VGGTOmega().eval()
     state_dict = torch.load(checkpoint_path, map_location='cpu')
     model.load_state_dict(state_dict)
@@ -149,25 +154,29 @@ def save_trajectory_png(extrinsic_w2c: np.ndarray, save_path: str):
 
 
 def save_ply(predictions: dict, save_path: str):
-    # Compute camera sphere radius = 1/5 of auto-default (spread * 0.01 → spread * 0.002)
-    extrinsic = predictions['extrinsic']
-    R = extrinsic[:, :3, :3]
-    t = extrinsic[:, :3, 3]
-    cam_centers = -np.einsum('nij,nj->ni', R.transpose(0, 2, 1), t)
-    spread = float(np.abs(cam_centers).max()) + 1e-6
-    pts = predictions['world_points_from_depth']
-    if len(pts):
-        spread = max(spread, float(np.abs(pts).max()))
-    cam_radius = spread * 0.002  # 1/5 of default spread * 0.01
-
     pc = predictions_to_ply(
         predictions,
         conf_thres=CONF_THRES,
         max_points=MAX_POINTS,
-        cam_sphere_pts=300,
-        cam_sphere_radius=cam_radius,
+        cam_sphere_pts=0,
     )
     pc.export(save_path)
+    print(f'  Saved: {save_path}')
+
+
+def save_prediction_pose(predictions: dict, save_path: str,
+                         start_sec: float, fps: float):
+    n = len(predictions['extrinsic'])
+    frame_indices = np.arange(n, dtype=np.int64)
+    timestamps = start_sec + frame_indices.astype(np.float64) / fps
+    np.savez_compressed(
+        save_path,
+        extrinsic_w2c=predictions['extrinsic'],
+        intrinsic=predictions['intrinsic'],
+        pose_enc=predictions['pose_enc'],
+        timestamps=timestamps,
+        frame_indices=frame_indices,
+    )
     print(f'  Saved: {save_path}')
 
 
@@ -212,8 +221,7 @@ def save_original_clip(video_path: str, start_sec: float, end_sec: float,
 
 def list_rotation_clips():
     clips = []
-    for level in ROTATION_LEVELS:
-        clip_type = f'rotation_{level}'
+    for clip_type in ROTATION_LEVELS:
         input_dir = os.path.join(INPUT_BASE, clip_type)
         video_paths = sorted(glob.glob(os.path.join(input_dir, '*.mp4')))
         for video_path in video_paths:
@@ -235,7 +243,8 @@ def main():
         print(f'[{i+1}/{len(clips)}] {clip_type}/{clip_name}')
 
         # Skip if already done
-        if os.path.exists(os.path.join(out_dir, 'scene.ply')):
+        if (os.path.exists(os.path.join(out_dir, 'scene.ply')) and
+                os.path.exists(os.path.join(out_dir, 'predictions_pose.npz'))):
             print('  Already done, skipping.')
             continue
 
@@ -261,6 +270,9 @@ def main():
         print('  Saving outputs ...')
         save_trajectory_png(predictions['extrinsic'],
                             os.path.join(out_dir, 'camera_trajectory.png'))
+        save_prediction_pose(predictions,
+                             os.path.join(out_dir, 'predictions_pose.npz'),
+                             CLIP_START_SEC, SAMPLE_FPS)
         save_ply(predictions, os.path.join(out_dir, 'scene.ply'))
         save_original_clip(video_path, CLIP_START_SEC, CLIP_END_SEC,
                            os.path.join(out_dir, 'original.mp4'))
